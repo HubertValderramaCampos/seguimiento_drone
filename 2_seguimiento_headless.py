@@ -22,6 +22,9 @@ import numpy as np
 import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
+import requests
+import base64
+from datetime import datetime
 
 # Cargar variables de entorno
 load_dotenv()
@@ -34,6 +37,14 @@ DB_NAME = os.getenv("DB_NAME", "drondb")
 DB_USER = os.getenv("DB_USER", "admin")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "12345")
 DB_CHECK_INTERVAL = 2  # segundos entre chequeos
+
+# Evolution API (WhatsApp)
+EVOLUTION_BASE_URL = os.getenv("BASE_URL_EVOLUTION_API", "").strip()
+EVOLUTION_API_KEY = os.getenv("API_KEY_EVOLUTION_API", "").strip()
+EVOLUTION_INSTANCE = os.getenv("INSTANCE_EVOLUTION_API", "").strip()
+NUMERO_WHATSAPP = os.getenv("NUMERO_ENVIAR_SMS", "").strip()
+VIDEO_DURACION = 25  # segundos de video a capturar
+VIDEO_COOLDOWN = 60  # segundos entre envíos (evitar spam)
 
 # PTZ Camera
 IP = "192.168.101.19"
@@ -141,6 +152,169 @@ class ControladorDB:
         if self.conn and not self.conn.closed:
             self.conn.close()
             print("[DB] Conexión cerrada")
+
+
+class VideoGrabador:
+    """Graba video de 5 segundos y envía por WhatsApp usando Evolution API"""
+    def __init__(self):
+        self.grabando = False
+        self.ultimo_envio = 0
+        self.video_path = None
+
+    def puede_enviar(self):
+        """Verifica si ha pasado suficiente tiempo desde el último envío"""
+        return (time.time() - self.ultimo_envio) >= VIDEO_COOLDOWN
+
+    def grabar_video(self, stream):
+        """Graba VIDEO_DURACION segundos de video desde el stream"""
+        if self.grabando:
+            return None
+
+        self.grabando = True
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_filename = f"sospechoso_{timestamp}.mp4"
+        video_path = os.path.join(os.getcwd(), video_filename)
+
+        print(f"[VIDEO] Iniciando grabación de {VIDEO_DURACION}s...")
+
+        try:
+            # Obtener dimensiones del frame
+            _, sample_frame = stream.get_latest()
+            if sample_frame is None:
+                print("[VIDEO ERROR] No hay frames disponibles")
+                self.grabando = False
+                return None
+
+            h, w = sample_frame.shape[:2]
+
+            # Reducir resolución para disminuir tamaño del archivo
+            # Reducir a 50% del tamaño original (máximo 640px de ancho)
+            scale = 0.5 if w > 640 else 1.0
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+
+            fps = 15  # Reducir FPS para menor tamaño
+
+            # Configurar codec mp4v (compatible con contenedor MP4)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(video_path, fourcc, fps, (new_w, new_h))
+
+            if not out.isOpened():
+                print("[VIDEO ERROR] No se pudo crear el archivo de video")
+                self.grabando = False
+                return None
+
+            # Grabar durante VIDEO_DURACION segundos
+            frames_grabados = 0
+            tiempo_inicio = time.time()
+
+            while (time.time() - tiempo_inicio) < VIDEO_DURACION:
+                _, frame = stream.get_latest()
+                if frame is not None:
+                    # Redimensionar frame si es necesario
+                    if scale != 1.0:
+                        frame = cv2.resize(frame, (new_w, new_h))
+                    out.write(frame)
+                    frames_grabados += 1
+                time.sleep(1.0 / fps)  # Ajustar según FPS configurado
+
+            out.release()
+
+            # Verificar que el archivo se creó correctamente
+            if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+                print(f"[VIDEO] Grabación completada: {frames_grabados} frames, {os.path.getsize(video_path)} bytes")
+                self.video_path = video_path
+                self.grabando = False
+                return video_path
+            else:
+                print("[VIDEO ERROR] El archivo de video está vacío o no existe")
+                self.grabando = False
+                return None
+
+        except Exception as e:
+            print(f"[VIDEO ERROR] Error al grabar: {e}")
+            if out:
+                out.release()
+            self.grabando = False
+            return None
+
+    def enviar_video_whatsapp(self, video_path):
+        """Envía el video por WhatsApp usando Evolution API v1"""
+        if not EVOLUTION_BASE_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
+            print("[WHATSAPP ERROR] Credenciales de Evolution API no configuradas")
+            return False
+
+        if not NUMERO_WHATSAPP:
+            print("[WHATSAPP ERROR] Número de WhatsApp no configurado")
+            return False
+
+        try:
+            # Leer y codificar el video en base64
+            with open(video_path, 'rb') as video_file:
+                video_base64 = base64.b64encode(video_file.read()).decode('utf-8')
+
+            # Preparar la URL del endpoint
+            url = f"{EVOLUTION_BASE_URL}/message/sendMedia/{EVOLUTION_INSTANCE}"
+
+            # Preparar headers
+            headers = {
+                'Content-Type': 'application/json',
+                'apikey': EVOLUTION_API_KEY
+            }
+
+            # Preparar el body según formato Evolution API (base64 puro, sin prefijo)
+            timestamp_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            payload = {
+                'number': NUMERO_WHATSAPP,
+                'mediatype': 'video',
+                'mimetype': 'video/mp4',
+                'caption': f"ALERTA: Sospechoso detectado\nFecha: {timestamp_str}\nDuracion: {VIDEO_DURACION}s",
+                'media': video_base64,  # Base64 puro sin prefijo data:video/mp4;base64,
+                'delay': 1000
+            }
+
+            tamaño_mb = os.path.getsize(video_path) / (1024 * 1024)
+            print(f"[WHATSAPP] Enviando video a {NUMERO_WHATSAPP}...")
+            print(f"[WHATSAPP] Tamaño: {tamaño_mb:.2f} MB ({os.path.getsize(video_path)} bytes)")
+            print(f"[WHATSAPP] Esto puede tardar varios minutos...")
+
+            # Enviar la petición con timeout largo (5 minutos para videos grandes)
+            timeout_segundos = 300  # 5 minutos
+            print(f"[WHATSAPP] Timeout configurado: {timeout_segundos}s")
+
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=timeout_segundos)
+
+                if response.status_code in [200, 201]:
+                    print(f"[WHATSAPP] ✓ Video enviado exitosamente")
+                    self.ultimo_envio = time.time()
+
+                    # Eliminar el archivo local después de enviarlo
+                    try:
+                        os.remove(video_path)
+                        print(f"[VIDEO] Archivo temporal eliminado: {video_path}")
+                    except:
+                        pass
+
+                    return True
+                else:
+                    print(f"[WHATSAPP ERROR] Error al enviar: {response.status_code}")
+                    print(f"[WHATSAPP ERROR] Respuesta: {response.text}")
+                    return False
+
+            except requests.exceptions.Timeout:
+                print(f"[WHATSAPP ERROR] Timeout al enviar video ({timeout_segundos}s)")
+                print(f"[WHATSAPP ERROR] El video es muy grande ({tamaño_mb:.2f} MB)")
+                return False
+            except requests.exceptions.RequestException as e:
+                print(f"[WHATSAPP ERROR] Error de conexión: {e}")
+                return False
+
+        except Exception as e:
+            print(f"[WHATSAPP ERROR] Error al enviar video: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 
 class ControladorPID:
@@ -604,6 +778,10 @@ class TrackerPTZ:
         self.pid_tilt = ControladorPID(KP, KI, KD)
         self.filtro = FiltroKalmanSimple(HISTORIAL_SIZE)
 
+        # Inicializar grabador de video
+        self.video_grabador = VideoGrabador()
+        self.detecciones_consecutivas = 0  # Contador para evitar falsos positivos
+
         self.visualizador = None
         if MOSTRAR_VIDEO:
             print("[6/6] Iniciando visualización...")
@@ -618,6 +796,10 @@ class TrackerPTZ:
         print(f"     PID: Kp={KP}, Ki={KI}, Kd={KD}")
         print(f"     Zona muerta: {ZONA_MUERTA*100:.0f}%")
         print(f"     Control DB: Activo (chequeo cada {DB_CHECK_INTERVAL}s)")
+        if EVOLUTION_BASE_URL and NUMERO_WHATSAPP:
+            print(f"     WhatsApp: Activo (envío a {NUMERO_WHATSAPP})")
+        else:
+            print(f"     WhatsApp: Desactivado (configurar .env)")
         print("     Ctrl+C o 'Q' para detener")
         print("-"*50)
     
@@ -674,21 +856,40 @@ class TrackerPTZ:
                 px, py, conf, bbox = deteccion
                 self.stats['detections'] += 1
                 frames_sin_deteccion = 0
-                
+                self.detecciones_consecutivas += 1
+
                 # Normalizar posición (0-1)
                 px_norm = px / w
                 py_norm = py / h
-                
+
                 # Filtrar posición para suavizar
                 px_filtrado, py_filtrado = self.filtro.actualizar(px_norm, py_norm)
-                
+
                 # Error desde centro (0.5)
                 ex = px_filtrado - 0.5
                 ey = py_filtrado - 0.5
-                
+
                 info['conf'] = conf
                 info['error'] = (ex, ey)
                 info['bbox'] = bbox
+
+                # Grabar y enviar video si hay detección estable
+                if (self.detecciones_consecutivas >= 10 and  # Al menos 10 frames consecutivos
+                    conf >= 0.6 and  # Confianza alta
+                    self.video_grabador.puede_enviar() and  # Ha pasado el cooldown
+                    not self.video_grabador.grabando):  # No está grabando actualmente
+
+                    print(f"\n[ALERTA] Sospechoso detectado con confianza {conf:.2%}")
+                    print("[ALERTA] Iniciando grabación y envío por WhatsApp...")
+
+                    # Ejecutar en thread separado para no bloquear el tracking
+                    def grabar_y_enviar():
+                        video_path = self.video_grabador.grabar_video(self.stream)
+                        if video_path:
+                            self.video_grabador.enviar_video_whatsapp(video_path)
+
+                    thread_video = threading.Thread(target=grabar_y_enviar, daemon=True)
+                    thread_video.start()
                 
                 # Determinar zona y acción
                 error_mag = np.sqrt(ex**2 + ey**2)
@@ -732,7 +933,8 @@ class TrackerPTZ:
                           f"Vel:({vel_pan:+.3f},{vel_tilt:+.3f})")
             else:
                 frames_sin_deteccion += 1
-                
+                self.detecciones_consecutivas = 0  # Resetear contador
+
                 if frames_sin_deteccion > 20:
                     self.ptz.parar()
                     self.pid_pan.reset()
@@ -740,7 +942,7 @@ class TrackerPTZ:
                     self.filtro.reset()
                     vel_pan = 0
                     vel_tilt = 0
-                    
+
                     if frames_sin_deteccion == 21:
                         print("[WARN] Objetivo perdido")
             

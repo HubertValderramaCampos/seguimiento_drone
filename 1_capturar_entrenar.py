@@ -18,18 +18,18 @@ RTSP_URL = f"rtsp://{IP}:554/user=admin&password=&channel=1&stream=0.sdp"
 
 PERSONA_NOMBRE = "objetivo"
 DATASET_DIR = Path("dataset_persona")
-NUM_FRAMES_OBJETIVO = 200  # Frames a capturar
-MIN_CONFIANZA = 0.6  # Confianza mínima para capturar
+NUM_FRAMES_OBJETIVO = 150  # Frames a capturar (reducido para CPU)
+MIN_CONFIANZA = 0.5  # Confianza mínima para capturar (reducida para CPU)
 MIN_AREA_RATIO = 0.02  # Área mínima de bbox (2% del frame)
 MAX_AREA_RATIO = 0.7  # Área máxima (70% del frame)
-INTERVALO_CAPTURA = 0.1  # Segundos entre capturas (más rápido con GPU)
+INTERVALO_CAPTURA = 0.3  # Segundos entre capturas (optimizado para CPU)
 VARIACION_MIN = 25  # Píxeles de movimiento para considerar nueva pose
 
-# Entrenamiento (Optimizado para GPU)
-EPOCHS = 50
-BATCH_SIZE = 16  # Aumentado para GPU
-IMG_SIZE = 640
-WORKERS = 8  # Threads paralelos para carga de datos
+# Entrenamiento (Optimizado para CPU/Laptop)
+EPOCHS = 30  # Reducido para CPU
+BATCH_SIZE = 4  # Reducido para CPU
+IMG_SIZE = 416  # Reducido para procesamiento más rápido en CPU
+WORKERS = 2  # Reducido para CPU
 # ==========================================
 
 
@@ -45,13 +45,13 @@ def detectar_device():
             return 0
     except Exception as e:
         print(f"[!] Error detectando GPU: {e}")
-    print("[CPU] Usando CPU (MUY LENTO)")
+    print("[CPU] Usando CPU - Configuración optimizada para laptop")
     return 'cpu'
 
 
 class StreamBuffer:
-    """Buffer de stream sin pérdida"""
-    def __init__(self, url, buffer_size=30):
+    """Buffer de stream sin pérdida - Optimizado para CPU"""
+    def __init__(self, url, buffer_size=10):  # Reducido para ahorrar memoria en CPU
         self.url = url
         self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -93,7 +93,7 @@ class StreamBuffer:
 
 
 class DetectorPersona:
-    """Detector de personas con YOLOv8 acelerado por GPU"""
+    """Detector de personas con YOLOv8 - Optimizado para CPU"""
     def __init__(self):
         try:
             from ultralytics import YOLO
@@ -104,24 +104,29 @@ class DetectorPersona:
             from ultralytics import YOLO
             self.YOLO = YOLO
 
-        print("[+] Cargando YOLOv8 en GPU...")
-        # Forzar uso de GPU con device=0
-        self.model = self.YOLO("yolov8n.pt")
         self.device = detectar_device()
+        print(f"[+] Cargando YOLOv8n (nano) optimizado para {'GPU' if self.device == 0 else 'CPU'}...")
 
-        # Warmup GPU
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        # Usar modelo nano (más ligero)
+        self.model = self.YOLO("yolov8n.pt")
+
+        # Warmup - con tamaño reducido para CPU
+        warmup_size = 416 if self.device == 'cpu' else 640
+        dummy = np.zeros((warmup_size, warmup_size, 3), dtype=np.uint8)
         self.model(dummy, verbose=False, device=self.device)
         print(f"[OK] Detector listo en {'GPU' if self.device == 0 else 'CPU'}")
     
     def detectar_persona(self, frame):
         """
-        Detecta persona más grande/cercana con GPU
+        Detecta persona más grande/cercana
         Retorna: dict con info o None
         """
         h, w = frame.shape[:2]
-        # Ejecutar en GPU con half precision para mayor velocidad
-        results = self.model(frame, verbose=False, classes=[0], device=self.device, half=True if self.device == 0 else False)
+        # Ejecutar inferencia (half precision solo en GPU)
+        # Tamaño reducido para CPU = más rápido
+        imgsz = 416 if self.device == 'cpu' else 640
+        results = self.model(frame, verbose=False, classes=[0], device=self.device,
+                           half=True if self.device == 0 else False, imgsz=imgsz)
         
         if len(results) > 0 and len(results[0].boxes) > 0:
             boxes = results[0].boxes
@@ -339,9 +344,11 @@ def entrenar_modelo():
     print(f"Epochs: {EPOCHS}")
     
     if device == 'cpu':
-        print("\n[!] ADVERTENCIA: Entrenar en CPU es LENTO (1-3 horas)")
-        print("    Para GPU instala: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
-        resp = input("\n¿Continuar en CPU? (s/n): ").lower()
+        print("\n[!] ADVERTENCIA: Entrenamiento optimizado para CPU")
+        print("    Tiempo estimado: 30-60 minutos en laptop moderna")
+        print("    Para entrenar con GPU (más rápido):")
+        print("    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
+        resp = input("\n¿Continuar con CPU? (s/n): ").lower()
         if resp != 's':
             return None
     
@@ -350,43 +357,60 @@ def entrenar_modelo():
 
     # Configuración optimizada según device
     if device == 'cpu':
-        workers = 0
-        batch = 4
-        cache = False
-        print("\n[!] Entrenamiento en CPU será LENTO")
+        workers = 0  # 0 workers es más eficiente en CPU
+        batch = 2  # Batch pequeño para CPU
+        cache = False  # Sin cache para ahorrar RAM
+        imgsz = 320  # Imagen más pequeña para CPU
+        print("\n[!] Configuración CPU: batch=2, imgsz=320")
+        print("    Entrenamiento tomará ~30-60 minutos en laptop moderna")
     else:
         workers = WORKERS
         batch = BATCH_SIZE
         cache = True  # Cache en RAM para GPU
-        print(f"\n[GPU] Configuración: batch={batch}, workers={workers}")
+        imgsz = IMG_SIZE
+        print(f"\n[GPU] Configuración: batch={batch}, workers={workers}, imgsz={imgsz}")
 
-    # Entrenar con configuración GPU optimizada
+    # Configuración de augmentation según device
+    if device == 'cpu':
+        # Augmentation reducida para CPU
+        mosaic_val = 0.5
+        mixup_val = 0.0
+        copy_paste_val = 0.0
+        close_mosaic_val = 5
+    else:
+        # Augmentation completa para GPU
+        mosaic_val = 1.0
+        mixup_val = 0.15
+        copy_paste_val = 0.1
+        close_mosaic_val = 10
+
+    # Entrenar con configuración optimizada
     results = model.train(
         data=str(DATASET_DIR / 'dataset.yaml'),
         epochs=EPOCHS,
-        imgsz=IMG_SIZE,
+        imgsz=imgsz,  # Variable según device
         batch=batch,
         name=f'{PERSONA_NOMBRE}_detector',
-        patience=20,
+        patience=15,  # Reducido para CPU
         save=True,
         device=device,
         workers=workers,
-        cache=cache,  # Cache en RAM
+        cache=cache,
         augment=True,
-        mosaic=1.0,
-        mixup=0.15,
-        copy_paste=0.1,  # Copy-paste augmentation
-        degrees=15,
-        translate=0.15,
-        scale=0.5,
+        mosaic=mosaic_val,
+        mixup=mixup_val,
+        copy_paste=copy_paste_val,
+        degrees=10,  # Reducido
+        translate=0.1,  # Reducido
+        scale=0.3,  # Reducido
         fliplr=0.5,
-        hsv_h=0.015,
-        hsv_s=0.7,
-        hsv_v=0.4,
+        hsv_h=0.01,  # Reducido
+        hsv_s=0.5,  # Reducido
+        hsv_v=0.3,  # Reducido
         verbose=True,
-        amp=True if device == 0 else False,  # Automatic Mixed Precision en GPU
+        amp=True if device == 0 else False,  # AMP solo en GPU
         plots=True,
-        close_mosaic=10  # Últimas epochs sin mosaic para mejor precisión
+        close_mosaic=close_mosaic_val
     )
     
     # Copiar mejor modelo

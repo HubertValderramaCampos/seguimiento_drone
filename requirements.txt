@@ -1,22 +1,50 @@
-# Dependencias del sistema de seguimiento PTZ
+# ================================================================
+# SISTEMA DE SEGUIMIENTO PTZ CON YOLO - OPTIMIZADO PARA CPU/GPU
 # Python 3.8+
+# ================================================================
 
-# YOLO y detección
-ultralytics>=8.0.0
-torch>=2.0.0
-torchvision>=0.15.0
+# ==================== INSTALACIÓN ====================
+#
+# Para CPU (Laptop/PC sin GPU):
+#   pip install -r requirements.txt
+#
+# Para GPU (PC con NVIDIA):
+#   1. Instalar primero torch con CUDA:
+#      pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   2. Luego instalar el resto:
+#      pip install -r requirements.txt
+#
+# ====================================================
 
-# Procesamiento de video
-opencv-python>=4.8.0
-numpy>=1.24.0
+# ==================== CORE: YOLO y Detección ====================
+ultralytics>=8.3.0              # YOLOv8 - Detección de personas
+torch>=2.0.0                    # PyTorch (CPU por defecto, ver instrucciones para GPU)
+torchvision>=0.15.0             # Visión computacional de PyTorch
 
-# Control PTZ (ONVIF)
-onvif-zeep>=0.2.12
-zeep>=4.2.1
+# ==================== Procesamiento de Video ====================
+opencv-python>=4.8.0            # OpenCV - Captura y procesamiento de video/imágenes
+opencv-contrib-python>=4.8.0    # Módulos extra de OpenCV
+numpy>=1.24.0,<2.0.0           # Arrays y operaciones numéricas
 
-# Base de datos PostgreSQL
-psycopg2-binary>=2.9.9
-python-dotenv>=1.0.0
+# ==================== Control PTZ (ONVIF) ====================
+onvif-zeep>=0.2.12             # Cliente ONVIF para cámaras PTZ
+zeep>=4.2.1                     # Cliente SOAP para ONVIF
+urllib3>=2.0.0                  # HTTP library (requerido por onvif)
 
-# Utilidades
-pillow>=10.0.0
+# ==================== Base de Datos ====================
+psycopg2-binary>=2.9.9         # PostgreSQL adapter
+python-dotenv>=1.0.0            # Variables de entorno desde .env
+
+# ==================== API y Comunicaciones ====================
+requests>=2.31.0                # HTTP requests (WhatsApp/Evolution API)
+
+# ==================== Utilidades ====================
+pillow>=10.0.0                  # Procesamiento de imágenes
+pyyaml>=6.0                     # YAML config files (usado por YOLO)
+
+# ==================== Opcional: Aceleración ====================
+# Para mejor rendimiento en CPU Intel/AMD:
+# pip install intel-openmp mkl
+
+# Para monitoreo de rendimiento:
+# pip install psutil gputil
